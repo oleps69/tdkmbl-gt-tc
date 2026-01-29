@@ -6,6 +6,8 @@ import io
 from insightface.app import FaceAnalysis
 import threading
 import os
+# import cv2  # eski
+import cv2 as cv2  # veya baştan headless yüklü ise sorun yok
 
 app = FastAPI()
 
