@@ -1,113 +1,91 @@
-import os
 import pickle
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
-from insightface.app import FaceAnalysis
-from typing import Dict
-from io import BytesIO
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from PIL import Image
+import io
+from insightface.app import FaceAnalysis
 
-# =====================
-# CONFIG
-# =====================
-EMBEDDINGS_PATH = "face_embeddings.pkl"
-THRESHOLD = float(os.getenv("FACE_THRESHOLD", 0.6))
+app = FastAPI()
 
-# =====================
-# LOAD MODEL
-# =====================
-app_face = FaceAnalysis(
-    name="buffalo_l",
-    providers=["CPUExecutionProvider"]
-)
-app_face.prepare(ctx_id=0, det_size=(640, 640))
+MODEL = None
+EMBEDDINGS_DB = None
+THRESHOLD = 0.6
 
-# =====================
-# LOAD EMBEDDINGS
-# =====================
-with open(EMBEDDINGS_PATH, "rb") as f:
-    DATA = pickle.load(f)
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-# ÖNEMLİ: DATA formatı önceki kodda pickle.dump({"embeddings": list_of_embs, "labels": list_of_labels})
-KNOWN_EMBEDDINGS = np.array(DATA["embeddings"], dtype=np.float32)
-KNOWN_LABELS = DATA["labels"]
+@app.on_event("startup")
+async def load_model():
+    global MODEL, EMBEDDINGS_DB
+    
+    try:
+        MODEL = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+        MODEL.prepare(ctx_id=-1, det_size=(640, 640))
+    except Exception as e:
+        raise RuntimeError(f"Model loading failed: {e}")
+    
+    try:
+        with open("face_embeddings.pkl", "rb") as f:
+            EMBEDDINGS_DB = pickle.load(f)
+    except FileNotFoundError:
+        raise RuntimeError("face_embeddings.pkl not found")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load embeddings: {e}")
 
-# =====================
-# FASTAPI
-# =====================
-app = FastAPI(title="Face Recognition API")
-
-# =====================
-# HELPERS
-# =====================
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    # normalize-free dot (both expected normalized but safe)
-    a_norm = a / (np.linalg.norm(a) + 1e-10)
-    b_norm = b / (np.linalg.norm(b) + 1e-10)
-    return float(np.dot(a_norm, b_norm))
-
-
-def identify_face(embedding: np.ndarray) -> Dict:
-    best_score = -1.0
-    best_label = "unknown"
-
-    for known_emb, label in zip(KNOWN_EMBEDDINGS, KNOWN_LABELS):
-        score = cosine_similarity(embedding, known_emb)
-        if score > best_score:
-            best_score = score
-            best_label = label
-
-    if best_score < THRESHOLD:
-        return {
-            "label": "unknown",
-            "confidence": round(best_score, 4)
-        }
-
-    return {
-        "label": best_label,
-        "confidence": round(best_score, 4)
-    }
-
-
-def load_image_from_bytes(contents: bytes) -> np.ndarray:
-    image = Image.open(BytesIO(contents)).convert("RGB")
-    return np.array(image)
-
-# =====================
-# ROUTES
-# =====================
-@app.get("/")
-def health():
-    return {
-        "status": "ok",
-        "threshold": THRESHOLD,
-        "known_faces": len(set(KNOWN_LABELS))
-    }
-
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    contents = await file.read()
-    img = load_image_from_bytes(contents)
-    faces = app_face.get(img)
-
-    if not faces:
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    
+    try:
+        image_data = await file.read()
+        image = Image.open(io.BytesIO(image_data))
+        image = image.convert("RGB")
+        img_array = np.array(image)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read image: {e}")
+    
+    try:
+        faces = MODEL.get(img_array)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Face detection failed: {e}")
+    
+    if len(faces) == 0:
+        raise HTTPException(status_code=400, detail="No face detected")
+    
+    if len(faces) > 1:
+        faces = sorted(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
+    
+    face = faces[0]
+    query_embedding = face.normed_embedding
+    
+    if query_embedding is None:
+        raise HTTPException(status_code=500, detail="Failed to extract embedding")
+    
+    names = EMBEDDINGS_DB["names"]
+    embeddings = EMBEDDINGS_DB["embeddings"]
+    
+    similarities = np.array([cosine_similarity(query_embedding, emb) for emb in embeddings])
+    max_idx = np.argmax(similarities)
+    max_similarity = similarities[max_idx]
+    
+    if max_similarity < THRESHOLD:
         return {
-            "success": False,
-            "message": "No face detected"
+            "name": "unknown",
+            "confidence": float(max_similarity),
+            "threshold": THRESHOLD
         }
-
-    results = []
-    for face in faces:
-        # face.embedding zaten numpy array
-        emb = face.embedding.astype(np.float32)
-        # normalize to be safe
-        emb = emb / (np.linalg.norm(emb) + 1e-10)
-        result = identify_face(emb)
-        results.append(result)
-
+    
     return {
-        "success": True,
-        "faces_detected": len(results),
-        "results": results
+        "name": names[max_idx],
+        "confidence": float(max_similarity),
+        "threshold": THRESHOLD
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
