@@ -8,6 +8,7 @@ import threading
 
 app = FastAPI()
 
+# --------- GLOBAL STATE ----------
 MODEL = None
 EMBEDDINGS_DB = None
 MODEL_READY = False
@@ -16,11 +17,17 @@ MODEL_LOCK = threading.Lock()
 THRESHOLD = 0.6
 
 
+# --------- UTILS ----------
 def cosine_similarity(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+# --------- MODEL LOADER ----------
 def ensure_model_loaded():
+    """
+    Lazy-load InsightFace model.
+    Railway RAM safe: only detection + recognition
+    """
     global MODEL, EMBEDDINGS_DB, MODEL_READY
 
     if MODEL_READY:
@@ -30,12 +37,14 @@ def ensure_model_loaded():
         if MODEL_READY:
             return
 
-        print("🔵 Lazy-loading InsightFace model...")
+        print("🔵 Lazy-loading InsightFace model (minimal)...")
 
         MODEL = FaceAnalysis(
             name="buffalo_l",
-            providers=["CPUExecutionProvider"]
+            providers=["CPUExecutionProvider"],
+            allowed_modules=["detection", "recognition"]  # 🔥 RAM FIX
         )
+
         MODEL.prepare(ctx_id=-1, det_size=(640, 640))
 
         try:
@@ -50,18 +59,26 @@ def ensure_model_loaded():
             }
 
         MODEL_READY = True
-        print("✅ Model ready")
+        print("✅ Model ready (minimal)")
 
 
+# --------- HEALTH ----------
 @app.get("/health")
 def health():
-    # Railway SADECE BUNU İSTİYOR
+    # Railway healthcheck
     return {"status": "ok"}
 
 
+# --------- OPTIONAL WARMUP ----------
+@app.post("/warmup")
+def warmup():
+    ensure_model_loaded()
+    return {"status": "ready"}
+
+
+# --------- PREDICT ----------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    # 🔑 MODEL BURADA YÜKLENİR
     ensure_model_loaded()
 
     if not file:
@@ -74,7 +91,10 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
-    faces = MODEL.get(img_array)
+    try:
+        faces = MODEL.get(img_array)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Face detection failed: {e}")
 
     if len(faces) == 0:
         return {
@@ -83,6 +103,7 @@ async def predict(file: UploadFile = File(...)):
             "reason": "no_face"
         }
 
+    # largest face
     faces = sorted(
         faces,
         key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
@@ -90,7 +111,10 @@ async def predict(file: UploadFile = File(...)):
     )
 
     face = faces[0]
-    embedding = face.normed_embedding
+    query_embedding = face.normed_embedding
+
+    if query_embedding is None:
+        raise HTTPException(status_code=500, detail="Embedding extraction failed")
 
     names = EMBEDDINGS_DB["names"]
     embeddings = EMBEDDINGS_DB["embeddings"]
@@ -102,7 +126,7 @@ async def predict(file: UploadFile = File(...)):
             "reason": "empty_database"
         }
 
-    similarities = np.dot(embeddings, embedding)
+    similarities = np.dot(embeddings, query_embedding)
     max_idx = int(np.argmax(similarities))
     max_similarity = float(similarities[max_idx])
 
