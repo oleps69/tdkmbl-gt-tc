@@ -5,7 +5,6 @@ from PIL import Image
 import io
 from insightface.app import FaceAnalysis
 import threading
-import os
 
 app = FastAPI()
 
@@ -21,22 +20,23 @@ def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
-def load_everything():
+def ensure_model_loaded():
     global MODEL, EMBEDDINGS_DB, MODEL_READY
+
+    if MODEL_READY:
+        return
 
     with MODEL_LOCK:
         if MODEL_READY:
             return
 
-        print("🔵 Loading InsightFace model...")
+        print("🔵 Lazy-loading InsightFace model...")
 
         MODEL = FaceAnalysis(
             name="buffalo_l",
             providers=["CPUExecutionProvider"]
         )
         MODEL.prepare(ctx_id=-1, det_size=(640, 640))
-
-        print("🟢 Model loaded")
 
         try:
             with open("face_embeddings.pkl", "rb") as f:
@@ -50,26 +50,19 @@ def load_everything():
             }
 
         MODEL_READY = True
-
-
-@app.on_event("startup")
-def startup_event():
-    # ⚠️ ASYNC YAPMIYORUZ — Railway sever
-    load_everything()
+        print("✅ Model ready")
 
 
 @app.get("/health")
 def health():
-    # Railway healthcheck için
-    if not MODEL_READY:
-        return {"status": "loading"}
+    # Railway SADECE BUNU İSTİYOR
     return {"status": "ok"}
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    if not MODEL_READY:
-        raise HTTPException(status_code=503, detail="Model loading")
+    # 🔑 MODEL BURADA YÜKLENİR
+    ensure_model_loaded()
 
     if not file:
         raise HTTPException(status_code=400, detail="No file uploaded")
@@ -81,10 +74,7 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
-    try:
-        faces = MODEL.get(img_array)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Face detection failed: {e}")
+    faces = MODEL.get(img_array)
 
     if len(faces) == 0:
         return {
@@ -93,7 +83,6 @@ async def predict(file: UploadFile = File(...)):
             "reason": "no_face"
         }
 
-    # En büyük yüzü al
     faces = sorted(
         faces,
         key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
@@ -102,9 +91,6 @@ async def predict(file: UploadFile = File(...)):
 
     face = faces[0]
     embedding = face.normed_embedding
-
-    if embedding is None:
-        raise HTTPException(status_code=500, detail="Embedding extraction failed")
 
     names = EMBEDDINGS_DB["names"]
     embeddings = EMBEDDINGS_DB["embeddings"]
