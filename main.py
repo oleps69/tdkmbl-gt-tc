@@ -85,7 +85,3 @@ async def predict(file: UploadFile = File(...)):
         "confidence": float(max_similarity),
         "threshold": THRESHOLD
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
