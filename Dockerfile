@@ -1,7 +1,6 @@
-# Dockerfile (kopyala - yapıştır)
 FROM python:3.10-slim
 
-# Sistem bağımlılıkları — onnxruntime için libgomp1 dahil
+# Sistem bağımlılıkları
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgomp1 \
@@ -15,10 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ÖNEMLİ: pip'i güncelle, sonra requirements yükle
+# ÖNEMLİ: pip güncelle ve requirements yükle
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip \
- && pip install --no-cache-dir -r /app/requirements.txt
+
+# onnxruntime'ı ÖNCE yükle
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir onnxruntime==1.16.3 && \
+    pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
