@@ -28,7 +28,8 @@ app_face.prepare(ctx_id=0, det_size=(640, 640))
 with open(EMBEDDINGS_PATH, "rb") as f:
     DATA = pickle.load(f)
 
-KNOWN_EMBEDDINGS = DATA["embeddings"]
+# ÖNEMLİ: DATA formatı önceki kodda pickle.dump({"embeddings": list_of_embs, "labels": list_of_labels})
+KNOWN_EMBEDDINGS = np.array(DATA["embeddings"], dtype=np.float32)
 KNOWN_LABELS = DATA["labels"]
 
 # =====================
@@ -40,7 +41,10 @@ app = FastAPI(title="Face Recognition API")
 # HELPERS
 # =====================
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    # normalize-free dot (both expected normalized but safe)
+    a_norm = a / (np.linalg.norm(a) + 1e-10)
+    b_norm = b / (np.linalg.norm(b) + 1e-10)
+    return float(np.dot(a_norm, b_norm))
 
 
 def identify_face(embedding: np.ndarray) -> Dict:
@@ -65,8 +69,8 @@ def identify_face(embedding: np.ndarray) -> Dict:
     }
 
 
-def load_image(file: UploadFile) -> np.ndarray:
-    image = Image.open(BytesIO(file.file.read())).convert("RGB")
+def load_image_from_bytes(contents: bytes) -> np.ndarray:
+    image = Image.open(BytesIO(contents)).convert("RGB")
     return np.array(image)
 
 # =====================
@@ -83,7 +87,8 @@ def health():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    img = load_image(file)
+    contents = await file.read()
+    img = load_image_from_bytes(contents)
     faces = app_face.get(img)
 
     if not faces:
@@ -94,7 +99,11 @@ async def predict(file: UploadFile = File(...)):
 
     results = []
     for face in faces:
-        result = identify_face(face.embedding)
+        # face.embedding zaten numpy array
+        emb = face.embedding.astype(np.float32)
+        # normalize to be safe
+        emb = emb / (np.linalg.norm(emb) + 1e-10)
+        result = identify_face(emb)
         results.append(result)
 
     return {
