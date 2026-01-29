@@ -1,141 +1,162 @@
+import os
+import io
+import threading
 import pickle
 import numpy as np
+import cv2
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from PIL import Image
-import io
 from insightface.app import FaceAnalysis
-import threading
-import os
-# import cv2  # eski
-import cv2 as cv2  # veya baştan headless yüklü ise sorun yok
 
-app = FastAPI()
+# =========================
+# CONFIG
+# =========================
+PICKLE_PATH = "face_embeddings.pkl"
+THRESHOLD = 0.6
+DET_SIZE = (640, 640)
 
-# --------- GLOBAL STATE ----------
+# =========================
+# APP
+# =========================
+app = FastAPI(title="Face Recognition API")
+
+# =========================
+# GLOBAL STATE
+# =========================
 MODEL = None
-EMBEDDINGS_DB = {"names": [], "embeddings": []}  # default boş
+EMBEDDINGS = None          # np.ndarray (N, 512)
+NAMES = []                 # list[str]
 MODEL_READY = False
-MODEL_LOCK = threading.Lock()
+LOCK = threading.Lock()
 
-THRESHOLD = 0.6  # Cosine similarity threshold
+# =========================
+# UTILS
+# =========================
+def cosine_similarity_matrix(db_embeddings, query_embedding):
+    # db_embeddings: (N, 512)
+    # query_embedding: (512,)
+    return np.dot(db_embeddings, query_embedding)
 
 
-# --------- UTILS ----------
-def cosine_similarity(a, b):
-    return float(np.dot(a, b))
-
-
-# --------- MODEL & EMBEDDINGS LOADER ----------
-def ensure_model_loaded():
-    global MODEL, EMBEDDINGS_DB, MODEL_READY
+# =========================
+# LOAD MODEL & DB
+# =========================
+def load_model_and_db():
+    global MODEL, EMBEDDINGS, NAMES, MODEL_READY
 
     if MODEL_READY:
         return
 
-    with MODEL_LOCK:
+    with LOCK:
         if MODEL_READY:
             return
 
         print("🔵 Loading InsightFace model...")
-
-        # Model setup (minimal)
         MODEL = FaceAnalysis(
             name="buffalo_l",
             providers=["CPUExecutionProvider"],
             allowed_modules=["detection", "recognition"]
         )
-        MODEL.prepare(ctx_id=-1, det_size=(640, 640))
+        MODEL.prepare(ctx_id=-1, det_size=DET_SIZE)
         print("✅ Model loaded")
 
-        # Load embeddings from training pickle
-        pickle_path = "face_embeddings.pkl"
-        if os.path.exists(pickle_path):
-            try:
-                raw_data = pickle.load(open(pickle_path, "rb"))
-                if isinstance(raw_data, dict):
-                    # Convert {person: embedding} -> {"names": [], "embeddings": []}
-                    names = []
-                    embeddings = []
-                    for person, emb in raw_data.items():
-                        emb = np.array(emb, dtype=np.float32)
-                        norm = np.linalg.norm(emb)
-                        if norm > 0:
-                            emb = emb / norm
-                            names.append(person)
-                            embeddings.append(emb)
-                    EMBEDDINGS_DB = {"names": names, "embeddings": embeddings}
-                    print(f"🟢 Loaded {len(names)} embeddings from pickle")
-                else:
-                    raise ValueError("Pickle format invalid, expected dict")
-            except Exception as e:
-                print("⚠️ Failed to load embeddings:", e)
-                EMBEDDINGS_DB = {"names": [], "embeddings": []}
-        else:
-            print("⚠️ face_embeddings.pkl not found, DB empty")
+        # ---- Load embeddings ----
+        if not os.path.exists(PICKLE_PATH):
+            raise RuntimeError("face_embeddings.pkl not found")
+
+        raw = pickle.load(open(PICKLE_PATH, "rb"))
+        if not isinstance(raw, dict) or len(raw) == 0:
+            raise RuntimeError("Embedding pickle invalid or empty")
+
+        names = []
+        embs = []
+
+        for person, emb in raw.items():
+            emb = np.asarray(emb, dtype=np.float32)
+            norm = np.linalg.norm(emb)
+            if norm == 0:
+                continue
+            emb = emb / norm
+            names.append(person)
+            embs.append(emb)
+
+        if not embs:
+            raise RuntimeError("No valid embeddings loaded")
+
+        NAMES = names
+        EMBEDDINGS = np.vstack(embs)
 
         MODEL_READY = True
-        print("✅ Model ready")
+        print(f"🟢 Loaded {len(NAMES)} identities")
+        print("✅ System ready")
 
 
-# --------- HEALTH ----------
+# =========================
+# ENDPOINTS
+# =========================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-# --------- WARMUP ----------
 @app.post("/warmup")
 def warmup():
-    ensure_model_loaded()
-    return {"status": "ready"}
+    load_model_and_db()
+    return {"status": "ready", "identities": len(NAMES)}
 
 
-# --------- PREDICT ----------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    ensure_model_loaded()
+    load_model_and_db()
 
-    if not file:
-        raise HTTPException(status_code=400, detail="No file uploaded")
+    if file is None:
+        raise HTTPException(400, "File missing")
 
-    # Load image
+    # ---- Load image ----
     try:
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.array(image)
+        img_bytes = await file.read()
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = np.array(pil_img)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+        raise HTTPException(400, f"Invalid image: {e}")
 
-    # Detect faces
-    try:
-        faces = MODEL.get(img_array)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Face detection failed: {e}")
-
+    # ---- Detect faces ----
+    faces = MODEL.get(img)
     if not faces:
-        return {"name": "unknown", "confidence": 0.0, "reason": "no_face"}
+        return {
+            "name": "unknown",
+            "confidence": 0.0,
+            "reason": "no_face"
+        }
 
-    # Pick largest face
-    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-    query_embedding = face.normed_embedding
+    # ---- Pick largest face ----
+    face = max(
+        faces,
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+    )
 
-    if query_embedding is None:
-        raise HTTPException(status_code=500, detail="Embedding extraction failed")
+    query_emb = face.embedding
+    if query_emb is None:
+        raise HTTPException(500, "Embedding extraction failed")
 
-    # Check DB
-    if not EMBEDDINGS_DB["embeddings"]:
-        return {"name": "unknown", "confidence": 0.0, "reason": "empty_database"}
+    query_emb = query_emb.astype(np.float32)
+    query_emb /= np.linalg.norm(query_emb)
 
-    # Compute similarities
-    similarities = np.dot(EMBEDDINGS_DB["embeddings"], query_embedding)
-    max_idx = int(np.argmax(similarities))
-    max_similarity = float(similarities[max_idx])
+    # ---- Compare ----
+    sims = cosine_similarity_matrix(EMBEDDINGS, query_emb)
+    best_idx = int(np.argmax(sims))
+    best_score = float(sims[best_idx])
 
-    if max_similarity < THRESHOLD:
-        return {"name": "unknown", "confidence": max_similarity, "threshold": THRESHOLD}
+    if best_score < THRESHOLD:
+        return {
+            "name": "unknown",
+            "confidence": best_score,
+            "threshold": THRESHOLD
+        }
 
     return {
-        "name": EMBEDDINGS_DB["names"][max_idx],
-        "confidence": max_similarity,
+        "name": NAMES[best_idx],
+        "confidence": best_score,
         "threshold": THRESHOLD
     }
