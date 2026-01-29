@@ -3,7 +3,6 @@ import io
 import threading
 import pickle
 import numpy as np
-import cv2
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from PIL import Image
