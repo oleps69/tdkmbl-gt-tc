@@ -1,11 +1,13 @@
 """
-Production-Ready Face Recognition REST API using InsightFace (buffalo_l)
-CPU-only, Docker-compatible, headless environment ready
+Memory-Optimized Face Recognition REST API
+CPU-only, minimal memory footprint, Docker-compatible
+Uses lightweight model with manual memory management
 """
 
 import os
 import pickle
 import threading
+import gc
 from typing import Optional, Dict, Any
 from io import BytesIO
 
@@ -16,54 +18,77 @@ import uvicorn
 from PIL import Image
 
 # Global variables
-app = FastAPI(title="Face Recognition API", version="1.0.0")
-face_model = None
+app = FastAPI(title="Face Recognition API (Optimized)", version="2.0.0")
+face_detector = None
+face_recognizer = None
 face_embeddings_db = None
 model_lock = threading.Lock()
 
 # Configuration
 EMBEDDING_DB_PATH = "face_embeddings.pkl"
-RECOGNITION_THRESHOLD = 0.40  # Cosine similarity threshold
-DET_SIZE = (640, 640)
-MODEL_NAME = "buffalo_l"
+RECOGNITION_THRESHOLD = 0.35  # Slightly lower for lighter models
+DET_THRESH = 0.5  # Detection confidence threshold
+INPUT_SIZE = (112, 112)  # Standard face recognition input size
 
 
-def load_insightface_model():
+def load_lightweight_models():
     """
-    Lazy load InsightFace model with CPU configuration.
-    This function is called only when needed, not at import time.
+    Load minimal InsightFace models separately to reduce memory.
+    Uses only detection and recognition, skipping other analysis modules.
     """
-    global face_model
+    global face_detector, face_recognizer
     
-    if face_model is not None:
-        return face_model
+    if face_detector is not None and face_recognizer is not None:
+        return face_detector, face_recognizer
     
     with model_lock:
         # Double-check pattern
-        if face_model is not None:
-            return face_model
+        if face_detector is not None and face_recognizer is not None:
+            return face_detector, face_recognizer
         
         try:
-            # Import here to avoid crash at startup
-            from insightface.app import FaceAnalysis
+            # Import only when needed
+            from insightface.model_zoo import model_zoo
             
-            # Initialize with CPU-only configuration
-            model = FaceAnalysis(
-                name=MODEL_NAME,
-                providers=['CPUExecutionProvider']
-            )
+            # Load only detection model (much lighter than full FaceAnalysis)
+            print("Loading detection model...")
+            face_detector = model_zoo.get_model('retinaface_r50_v1')
+            face_detector.prepare(ctx_id=-1, input_size=(640, 640))
             
-            # Prepare with CPU context and detection size
-            model.prepare(
-                ctx_id=-1,  # CPU
-                det_size=DET_SIZE
-            )
+            # Load only recognition model
+            print("Loading recognition model...")
+            face_recognizer = model_zoo.get_model('arcface_r100_v1')
+            face_recognizer.prepare(ctx_id=-1)
             
-            face_model = model
-            return face_model
+            # Force garbage collection
+            gc.collect()
+            
+            print("Models loaded successfully!")
+            return face_detector, face_recognizer
             
         except Exception as e:
-            raise RuntimeError(f"Failed to load InsightFace model: {str(e)}")
+            # Fallback to even lighter model
+            try:
+                print(f"Primary models failed: {e}")
+                print("Trying lighter model combination...")
+                
+                from insightface.model_zoo import model_zoo
+                
+                # Use smaller detection model
+                face_detector = model_zoo.get_model('retinaface_mnet025_v2')
+                face_detector.prepare(ctx_id=-1, input_size=(320, 320))
+                
+                # Use smaller recognition model  
+                face_recognizer = model_zoo.get_model('arcface_mobileface_v1')
+                face_recognizer.prepare(ctx_id=-1)
+                
+                gc.collect()
+                
+                print("Lightweight models loaded successfully!")
+                return face_detector, face_recognizer
+                
+            except Exception as e2:
+                raise RuntimeError(f"Failed to load any models: {str(e2)}")
 
 
 def load_embedding_database() -> Dict[str, np.ndarray]:
@@ -109,27 +134,54 @@ def load_embedding_database() -> Dict[str, np.ndarray]:
             raise RuntimeError(f"Failed to load embedding database: {str(e)}")
 
 
-def get_largest_face(faces):
+def get_largest_face(bboxes, landmarks):
     """
     Select the largest face from detected faces based on bounding box area.
+    Returns the index of the largest face.
     """
-    if not faces:
+    if bboxes is None or len(bboxes) == 0:
         return None
     
-    largest_face = None
     max_area = 0
+    max_idx = 0
     
-    for face in faces:
-        bbox = face.bbox
+    for idx, bbox in enumerate(bboxes):
+        # bbox format: [x1, y1, x2, y2, score]
         width = bbox[2] - bbox[0]
         height = bbox[3] - bbox[1]
         area = width * height
         
         if area > max_area:
             max_area = area
-            largest_face = face
+            max_idx = idx
     
-    return largest_face
+    return max_idx
+
+
+def align_face(img, landmark):
+    """
+    Simple face alignment using landmarks.
+    Returns aligned face for better recognition.
+    """
+    from skimage import transform as trans
+    
+    # Standard face template (5 landmarks)
+    src = np.array([
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041]
+    ], dtype=np.float32)
+    
+    dst = landmark.astype(np.float32)
+    tform = trans.SimilarityTransform()
+    tform.estimate(dst, src)
+    
+    aligned = trans.warp(img, tform.inverse, output_shape=(112, 112))
+    aligned = (aligned * 255).astype(np.uint8)
+    
+    return aligned
 
 
 def recognize_face(face_embedding: np.ndarray, embeddings_db: Dict[str, np.ndarray]) -> tuple:
@@ -168,22 +220,23 @@ async def health_check():
     """
     Simple health check endpoint.
     """
-    return {"status": "healthy", "service": "face-recognition-api"}
+    return {"status": "healthy", "service": "face-recognition-api-optimized"}
 
 
 @app.post("/warmup")
 async def warmup():
     """
-    Pre-load model and embedding database.
+    Pre-load models and embedding database.
     Call this endpoint after deployment to avoid cold start on first prediction.
     """
     try:
-        load_insightface_model()
+        detector, recognizer = load_lightweight_models()
         embeddings_db = load_embedding_database()
         
         return {
             "status": "success",
-            "model_loaded": face_model is not None,
+            "detector_loaded": detector is not None,
+            "recognizer_loaded": recognizer is not None,
             "embeddings_count": len(embeddings_db)
         }
     except Exception as e:
@@ -214,8 +267,11 @@ async def predict(image: UploadFile = File(...)):
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
         
-        # Convert PIL image to numpy array
+        # Convert PIL image to numpy array (RGB format)
         image_array = np.array(pil_image)
+        
+        # Convert RGB to BGR for InsightFace (it expects BGR)
+        image_bgr = image_array[:, :, ::-1]
         
     except Exception as e:
         raise HTTPException(
@@ -224,8 +280,8 @@ async def predict(image: UploadFile = File(...)):
         )
     
     try:
-        # Load model and database
-        model = load_insightface_model()
+        # Load models and database
+        detector, recognizer = load_lightweight_models()
         embeddings_db = load_embedding_database()
         
         # Check if database is empty
@@ -237,10 +293,10 @@ async def predict(image: UploadFile = File(...)):
             })
         
         # Detect faces
-        faces = model.get(image_array)
+        bboxes, landmarks = detector.detect(image_bgr, threshold=DET_THRESH)
         
         # Check if any face detected
-        if not faces:
+        if bboxes is None or len(bboxes) == 0:
             return JSONResponse({
                 "name": "unknown",
                 "confidence": 0.0,
@@ -248,17 +304,35 @@ async def predict(image: UploadFile = File(...)):
             })
         
         # Select largest face
-        largest_face = get_largest_face(faces)
+        face_idx = get_largest_face(bboxes, landmarks)
         
-        if largest_face is None:
+        if face_idx is None:
             return JSONResponse({
                 "name": "unknown",
                 "confidence": 0.0,
                 "reason": "no_face"
             })
         
+        # Get landmark for alignment
+        landmark = landmarks[face_idx]
+        
+        # Align face
+        try:
+            aligned_face = align_face(image_bgr, landmark)
+        except:
+            # Fallback: crop face without alignment
+            bbox = bboxes[face_idx]
+            x1, y1, x2, y2 = map(int, bbox[:4])
+            face_crop = image_bgr[y1:y2, x1:x2]
+            
+            # Resize to standard size
+            from PIL import Image as PILImage
+            face_pil = PILImage.fromarray(face_crop[:, :, ::-1])
+            face_pil = face_pil.resize(INPUT_SIZE)
+            aligned_face = np.array(face_pil)[:, :, ::-1]
+        
         # Get face embedding
-        face_embedding = largest_face.normed_embedding
+        face_embedding = recognizer.get_embedding(aligned_face)
         
         # Recognize face
         recognized_name, confidence = recognize_face(face_embedding, embeddings_db)
@@ -283,6 +357,9 @@ async def predict(image: UploadFile = File(...)):
             status_code=500,
             detail=f"Prediction failed: {str(e)}"
         )
+    finally:
+        # Force garbage collection after each request to free memory
+        gc.collect()
 
 
 if __name__ == "__main__":
