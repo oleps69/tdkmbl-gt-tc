@@ -1,144 +1,119 @@
+import os
+import cv2
 import pickle
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from PIL import Image
-import io
+from fastapi import FastAPI, UploadFile, File
 from insightface.app import FaceAnalysis
-import threading
 
 app = FastAPI()
 
-# --------- GLOBAL STATE ----------
-MODEL = None
-EMBEDDINGS_DB = None
+# =========================
+# GLOBALS
+# =========================
+face_app = None
+embedding_db = {}
 MODEL_READY = False
-MODEL_LOCK = threading.Lock()
+DB_PATH = "face_embeddings.pkl"
+IMAGE_SIZE = (640, 640)
+THRESHOLD = 0.60
 
-THRESHOLD = 0.6
-
-
-# --------- UTILS ----------
-def cosine_similarity(a, b):
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
-
-
-# --------- MODEL LOADER ----------
-def ensure_model_loaded():
-    """
-    Lazy-load InsightFace model.
-    Railway RAM safe: only detection + recognition
-    """
-    global MODEL, EMBEDDINGS_DB, MODEL_READY
-
-    if MODEL_READY:
-        return
-
-    with MODEL_LOCK:
-        if MODEL_READY:
-            return
-
-        print("🔵 Lazy-loading InsightFace model (minimal)...")
-
-        MODEL = FaceAnalysis(
+# =========================
+# MODEL LOADER
+# =========================
+def load_model():
+    global face_app, MODEL_READY
+    if face_app is None:
+        print("🔵 Lazy-loading InsightFace model...")
+        face_app = FaceAnalysis(
             name="buffalo_l",
-            providers=["CPUExecutionProvider"],
-            allowed_modules=["detection", "recognition"]  # 🔥 RAM FIX
+            providers=["CPUExecutionProvider"]
         )
-
-        MODEL.prepare(ctx_id=-1, det_size=(640, 640))
-
-        try:
-            with open("face_embeddings.pkl", "rb") as f:
-                EMBEDDINGS_DB = pickle.load(f)
-            print("🟢 Embeddings loaded")
-        except Exception as e:
-            print("⚠️ Embeddings NOT loaded:", e)
-            EMBEDDINGS_DB = {
-                "names": [],
-                "embeddings": []
-            }
-
+        face_app.prepare(ctx_id=0, det_size=IMAGE_SIZE)
         MODEL_READY = True
-        print("✅ Model ready (minimal)")
+        print("✅ Model ready")
 
+def load_embedding_db():
+    global embedding_db
+    if os.path.exists(DB_PATH):
+        with open(DB_PATH, "rb") as f:
+            embedding_db = pickle.load(f)
+        print(f"📦 Loaded {len(embedding_db)} identities")
+    else:
+        print("⚠️ face_embeddings.pkl not found")
 
-# --------- HEALTH ----------
+# =========================
+# STARTUP
+# =========================
+@app.on_event("startup")
+def startup():
+    load_embedding_db()
+
+# =========================
+# UTILS
+# =========================
+def extract_embedding(img):
+    faces = face_app.get(img)
+    if not faces:
+        return None
+    face = max(faces, key=lambda f: f.bbox[2] * f.bbox[3])
+    emb = face.embedding.astype(np.float32)
+    return emb / np.linalg.norm(emb)
+
+def cosine_similarity(a, b):
+    return float(np.dot(a, b))
+
+def predict_identity(emb):
+    best_name = "unknown"
+    best_score = -1
+
+    for name, ref_emb in embedding_db.items():
+        score = cosine_similarity(emb, ref_emb)
+        if score > best_score:
+            best_score = score
+            best_name = name
+
+    confidence = (best_score + 1) / 2
+    if confidence < THRESHOLD:
+        return "unknown", confidence
+
+    return best_name, confidence
+
+# =========================
+# ROUTES
+# =========================
 @app.get("/health")
 def health():
-    # Railway healthcheck
     return {"status": "ok"}
 
-
-# --------- OPTIONAL WARMUP ----------
 @app.post("/warmup")
 def warmup():
-    ensure_model_loaded()
+    load_model()
     return {"status": "ready"}
 
-
-# --------- PREDICT ----------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    ensure_model_loaded()
+    if not MODEL_READY:
+        load_model()
 
-    if not file:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-
-    try:
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.array(image)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
-
-    try:
-        faces = MODEL.get(img_array)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Face detection failed: {e}")
-
-    if len(faces) == 0:
-        return {
-            "name": "unknown",
-            "confidence": 0.0,
-            "reason": "no_face"
-        }
-
-    # largest face
-    faces = sorted(
-        faces,
-        key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
-        reverse=True
-    )
-
-    face = faces[0]
-    query_embedding = face.normed_embedding
-
-    if query_embedding is None:
-        raise HTTPException(status_code=500, detail="Embedding extraction failed")
-
-    names = EMBEDDINGS_DB["names"]
-    embeddings = EMBEDDINGS_DB["embeddings"]
-
-    if len(embeddings) == 0:
+    if not embedding_db:
         return {
             "name": "unknown",
             "confidence": 0.0,
             "reason": "empty_database"
         }
 
-    similarities = np.dot(embeddings, query_embedding)
-    max_idx = int(np.argmax(similarities))
-    max_similarity = float(similarities[max_idx])
+    contents = await file.read()
+    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return {"error": "invalid_image"}
 
-    if max_similarity < THRESHOLD:
-        return {
-            "name": "unknown",
-            "confidence": max_similarity,
-            "threshold": THRESHOLD
-        }
+    emb = extract_embedding(img)
+    if emb is None:
+        return {"error": "no_face_detected"}
+
+    name, conf = predict_identity(emb)
 
     return {
-        "name": names[max_idx],
-        "confidence": max_similarity,
-        "threshold": THRESHOLD
+        "name": name,
+        "confidence": round(conf, 4)
     }
